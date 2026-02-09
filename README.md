@@ -11,6 +11,9 @@
 * Показва резултата в таблица
 * Записва готов .xlsx (Save As) - съвместим с Numbers за macOS
 
+## Architecture diagram:
+<img src="./test-excels/diagram file_processing.png" alt="Architecure diagram">
+
 ## Стартиране
 
 ```
