@@ -447,7 +447,8 @@ def merge_order_and_prices(order_path: str, prices_path_or_df) -> pd.DataFrame:
             "Материал": "" if p_mat is None or pd.isna(pr.get(p_mat)) else str(pr.get(p_mat)).strip(),
         }
         
-        # Only update if this is a new key or if this row has more filled price columns
+        # Only update if this is a new key or if this row has more or equal filled price columns
+        # (equal means later file wins - useful when combining multiple price files)
         new_count = count_filled_prices(pr)
         for key in [name, name_norm, name_canon]:
             if key is None:
@@ -456,9 +457,9 @@ def merge_order_and_prices(order_path: str, prices_path_or_df) -> pd.DataFrame:
             if existing is None:
                 prices_lookup[key] = info
             else:
-                # Compare: keep the row with more filled prices
+                # Compare: keep the row with more filled prices, or the later one if equal
                 old_count = count_filled_prices(existing["row"])
-                if new_count > old_count:
+                if new_count >= old_count:
                     prices_lookup[key] = info
 
     if DEBUG:
@@ -826,15 +827,17 @@ class App(tk.Tk):
         """Open dialog to select multiple price files."""
         popup = tk.Toplevel(self)
         popup.title("Качи цени")
-        popup.geometry("600x500")
+        popup.geometry("600x520")
         popup.transient(self)
-        popup.minsize(500, 400)
+        popup.minsize(500, 420)
         
         price_files = list(self._multiple_prices_paths)  # Copy existing
         
         # Title
-        ttk.Label(popup, text="Качи файлове с цени", font=("", 14, "bold")).pack(pady=(15, 10))
-        ttk.Label(popup, text="Цените ще бъдат обединени в един ценоразпис").pack(pady=(0, 10))
+        ttk.Label(popup, text="Качи файлове с цени", font=("", 14, "bold")).pack(pady=(15, 5))
+        ttk.Label(popup, text="Цените ще бъдат обединени в един ценоразпис").pack(pady=(0, 5))
+        ttk.Label(popup, text="⚠️ По-късно добавените файлове имат приоритет при дублиращи се артикули", 
+                  foreground="orange").pack(pady=(0, 10))
         
         # Add files button
         def add_files_dialog():
@@ -1114,8 +1117,9 @@ class App(tk.Tk):
         # Create window
         popup = tk.Toplevel(self)
         popup.title("Качи много поръчки")
-        popup.geometry("600x500")
+        popup.geometry("600x520")
         popup.transient(self)
+        popup.minsize(500, 420)
         
         order_files = []
         
@@ -1360,11 +1364,26 @@ class App(tk.Tk):
             self.status.set("Грешка при сливане.")
 
     def _combine_price_files(self, price_paths):
-        """Combine multiple price files into a single DataFrame."""
+        """Combine multiple price files into a single DataFrame.
+        
+        Normalizes article column names to a common name before combining.
+        """
+        # Possible names for the article column
+        article_col_names = ["код АЛ филтър", "артикул", "item", "item number", "код", "product"]
+        target_article_col = "код АЛ филтър"  # Unified name
+        
         dfs = []
         for path in price_paths:
             try:
                 df = read_excel_any(path)
+                
+                # Find and rename article column to unified name
+                for col in df.columns:
+                    if str(col).strip().lower() in [n.lower() for n in article_col_names]:
+                        if col != target_article_col:
+                            df = df.rename(columns={col: target_article_col})
+                        break
+                
                 dfs.append(df)
             except Exception as e:
                 print(f"Грешка при четене на {path}: {e}")
