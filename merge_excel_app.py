@@ -776,77 +776,109 @@ def load_inventory(inventory_path: str) -> pd.DataFrame:
     return df
 
 
+def _find_inv_col(columns, candidates: list) -> str:
+    """
+    Robustly find a column name from a list of candidates.
+    Strips BOM, extra whitespace, and compares case-insensitively.
+    Also does partial/contains matching as fallback.
+    """
+    # Normalize helper: strip BOM + whitespace, lower, collapse spaces
+    def norm(s):
+        return str(s).lstrip('\ufeff').strip().lower().replace('\xa0', ' ')
+
+    norm_candidates = [norm(c) for c in candidates]
+
+    # Pass 1 — exact match after normalising
+    for col in columns:
+        if norm(col) in norm_candidates:
+            return col
+
+    # Pass 2 — partial/contains match (e.g. "тех.лист" inside "тех.лист (номер)")
+    for col in columns:
+        n = norm(col)
+        for cand in norm_candidates:
+            if cand in n or n in cand:
+                return col
+
+    return None
+
+
 def check_inventory(df_order: pd.DataFrame, df_inventory: pd.DataFrame) -> pd.DataFrame:
     """
     Check order against inventory and add columns:
     - 'Налични' - how many are available in inventory
     - 'Статус наличност' - status (Достатъчно / Недостатъчно / Няма)
-    
+
     Matching is done by 'Технологичен лист' (тех.лист) column.
     """
-    # Build inventory lookup by tech list
-    inv_lookup = {}
-    
-    # Find columns in inventory
-    tl_col = None
-    qty_col = None
-    name_col = None
-    
-    for col in df_inventory.columns:
-        col_lower = str(col).strip().lower()
-        if col_lower in ['тех.лист', 'технологичен лист', 'тл']:
-            tl_col = col
-        elif col_lower in ['налични бройки', 'налични', 'количество', 'qty']:
-            qty_col = col
-        elif col_lower in ['име', 'артикул', 'name']:
-            name_col = col
-    
+    import logging
+
+    logging.debug("check_inventory: inventory columns = %s", list(df_inventory.columns))
+
+    # Find columns in inventory (robust, Windows-safe)
+    tl_col  = _find_inv_col(df_inventory.columns,
+                            ['тех.лист', 'технологичен лист', 'тл', 'tech list', 'tl'])
+    qty_col = _find_inv_col(df_inventory.columns,
+                            ['налични бройки', 'налични', 'количество', 'qty', 'quantity', 'бройки'])
+
+    logging.debug("check_inventory: tl_col=%s  qty_col=%s", tl_col, qty_col)
+
     if tl_col is None or qty_col is None:
-        # Can't process without these columns
         df_order['Налични'] = ''
         df_order['Статус наличност'] = 'Няма данни'
         return df_order
-    
-    # Build lookup
+
+    # Build lookup  { tl_str -> qty }
+    inv_lookup: dict = {}
     for _, row in df_inventory.iterrows():
         tl = row.get(tl_col)
         if pd.isna(tl):
             continue
-        tl_str = str(tl).strip()
+        tl_str = str(tl).lstrip('\ufeff').strip()
         qty = row.get(qty_col)
-        if pd.isna(qty):
+        try:
+            qty = int(float(qty)) if not pd.isna(qty) else 0
+        except Exception:
             qty = 0
-        else:
-            qty = int(qty)
         inv_lookup[tl_str] = qty
-    
-    # Add columns to order
+
+    logging.debug("check_inventory: built lookup with %d entries", len(inv_lookup))
+
+    # Find 'Технологичен лист' column in the order df (also robust)
+    order_tl_col = _find_inv_col(df_order.columns,
+                                 ['технологичен лист', 'тл', 'тех лист', 'tech list', 'tl'])
+
     available_list = []
     status_list = []
-    
+
     for _, row in df_order.iterrows():
-        tl = row.get('Технологичен лист', '')
+        tl_raw = row.get(order_tl_col, '') if order_tl_col else ''
         ordered_qty = row.get('Бройки', 0)
-        
-        if pd.isna(tl) or str(tl).strip() == '':
+
+        if pd.isna(tl_raw) or str(tl_raw).strip() == '':
             available_list.append('')
             status_list.append('')
             continue
-        
-        tl_str = str(tl).strip()
-        available = inv_lookup.get(tl_str, 0)
-        available_list.append(available)
-        
-        if available == 0:
+
+        tl_str = str(tl_raw).lstrip('\ufeff').strip()
+        available = inv_lookup.get(tl_str)   # None = not found at all
+
+        if available is None:
+            available_list.append('')
+            status_list.append('')
+        elif available == 0:
+            available_list.append(0)
             status_list.append('Няма')
         elif available >= ordered_qty:
+            available_list.append(available)
             status_list.append('Достатъчно')
         else:
+            available_list.append(available)
             status_list.append(f'Недостатъчно ({available})')
-    
+
     df_order['Налични'] = available_list
     df_order['Статус наличност'] = status_list
-    
+
     return df_order
 
 
@@ -854,82 +886,119 @@ def reserve_inventory(df_order: pd.DataFrame, inventory_path: str, order_ref: st
     """
     Reserve items from inventory based on order.
     Updates the inventory file by:
-    - Subtracting ordered quantities from available
+    - Subtracting ordered quantities from available (preserves cell colours/formatting via openpyxl)
     - Adding reservation note to history column
-    
+
     Returns: (success_count, failed_list)
     """
     from datetime import datetime
-    
+    from openpyxl import load_workbook
+    from openpyxl.utils import get_column_letter
+
     df_inventory = read_excel_any(inventory_path)
-    
-    # Find columns
-    tl_col = None
-    qty_col = None
-    history_col = None
-    
-    for col in df_inventory.columns:
-        col_lower = str(col).strip().lower()
-        if col_lower in ['тех.лист', 'технологичен лист', 'тл']:
-            tl_col = col
-        elif col_lower in ['налични бройки', 'налични', 'количество']:
-            qty_col = col
-        elif 'поръчка' in col_lower or 'history' in col_lower:
-            history_col = col
-    
+
+    # Robust column finding (handles BOM / Windows extra spaces)
+    tl_col      = _find_inv_col(df_inventory.columns,
+                                ['тех.лист', 'технологичен лист', 'тл', 'tech list', 'tl'])
+    qty_col     = _find_inv_col(df_inventory.columns,
+                                ['налични бройки', 'налични', 'количество', 'qty', 'quantity', 'бройки'])
+    history_col = _find_inv_col(df_inventory.columns,
+                                ['поръчка, бройка, дата', 'поръчка', 'история', 'history'])
+
     if tl_col is None or qty_col is None:
         return (0, ['Липсват необходими колони в файла с наличности'])
-    
+
+    # Map column name → 1-based Excel column index
+    col_list = list(df_inventory.columns)
+    tl_col_idx      = col_list.index(tl_col) + 1
+    qty_col_idx     = col_list.index(qty_col) + 1
+    history_col_idx = col_list.index(history_col) + 1 if history_col else None
+
+    # Also find 'Технологичен лист' in the order df
+    order_tl_col = _find_inv_col(df_order.columns,
+                                 ['технологичен лист', 'тл', 'тех лист', 'tech list', 'tl'])
+
     success_count = 0
-    failed_list = []
-    today = datetime.now().strftime('%d.%m')
-    
-    for _, order_row in df_order.iterrows():
-        tl = order_row.get('Технологичен лист', '')
-        ordered_qty = order_row.get('Бройки', 0)
-        order_no = order_row.get('Номер на поръчка и ред', order_ref or '')
-        
-        if pd.isna(tl) or str(tl).strip() == '' or ordered_qty == 0:
+    failed_list   = []
+    today         = datetime.now().strftime('%d.%m')
+
+    # Build TL → (df row index, current qty, history value) map from df_inventory
+    inv_map: dict = {}
+    for i, row in df_inventory.iterrows():
+        tl = row.get(tl_col)
+        if pd.isna(tl):
             continue
-        
-        tl_str = str(tl).strip()
-        
-        # Find matching row in inventory
-        mask = df_inventory[tl_col].astype(str).str.strip() == tl_str
-        if not mask.any():
+        tl_str = str(tl).lstrip('\ufeff').strip()
+        qty = row.get(qty_col)
+        try:
+            qty = int(float(qty)) if not pd.isna(qty) else 0
+        except Exception:
+            qty = 0
+        inv_map[tl_str] = {'df_idx': i, 'qty': qty}
+
+    # Collect updates: { df_idx: (new_qty, new_history) }
+    updates: dict = {}
+
+    for _, order_row in df_order.iterrows():
+        tl_raw     = order_row.get(order_tl_col, '') if order_tl_col else ''
+        ordered_qty = order_row.get('Бройки', 0)
+        order_no   = order_row.get('Номер на поръчка и ред', order_ref or '')
+
+        if pd.isna(tl_raw) or str(tl_raw).strip() == '' or ordered_qty == 0:
+            continue
+
+        tl_str = str(tl_raw).lstrip('\ufeff').strip()
+        entry  = inv_map.get(tl_str)
+
+        if entry is None:
             failed_list.append(f'{tl_str}: Не е намерен в наличности')
             continue
-        
-        idx = df_inventory[mask].index[0]
-        current_qty = df_inventory.loc[idx, qty_col]
-        if pd.isna(current_qty):
-            current_qty = 0
-        else:
-            current_qty = int(current_qty)
-        
+
+        df_idx      = entry['df_idx']
+        current_qty = entry['qty']
+
         if current_qty < ordered_qty:
             failed_list.append(f'{tl_str}: Недостатъчно ({current_qty} < {ordered_qty})')
-            # Still reserve what's available
-            reserved = current_qty
-            df_inventory.loc[idx, qty_col] = 0
+            reserved    = current_qty
+            new_qty     = 0
         else:
             reserved = ordered_qty
-            df_inventory.loc[idx, qty_col] = current_qty - ordered_qty
-        
-        # Update history
-        if history_col is not None:
-            current_history = df_inventory.loc[idx, history_col]
-            new_entry = f'{order_no} {reserved} {today}'
+            new_qty  = current_qty - ordered_qty
+
+        # Update the in-memory map so repeated articles accumulate
+        inv_map[tl_str]['qty'] = new_qty
+
+        new_entry = f'{order_no} {reserved} {today}'
+        if df_idx in updates:
+            # Multiple order rows for same TL
+            prev_qty, prev_hist = updates[df_idx]
+            updates[df_idx] = (new_qty, f'{prev_hist}; {new_entry}')
+        else:
+            current_history = df_inventory.loc[df_idx, history_col] if history_col else ''
             if pd.isna(current_history) or str(current_history).strip() == '':
-                df_inventory.loc[idx, history_col] = new_entry
+                hist = new_entry
             else:
-                df_inventory.loc[idx, history_col] = f'{current_history}; {new_entry}'
-        
+                hist = f'{current_history}; {new_entry}'
+            updates[df_idx] = (new_qty, hist)
+
         success_count += 1
-    
-    # Save updated inventory
-    df_inventory.to_excel(inventory_path, index=False)
-    
+
+    # ----------------------------------------------------------------
+    # Write back via openpyxl to PRESERVE cell colours / formatting
+    # ----------------------------------------------------------------
+    wb = load_workbook(inventory_path)
+    ws = wb.active
+
+    # Find header row (row 1) column positions in the actual workbook
+    # (openpyxl rows are 1-indexed; df row 0 = wb row 2 because row 1 is header)
+    for df_idx, (new_qty, new_hist) in updates.items():
+        wb_row = df_idx + 2  # +1 for header, +1 for 1-based indexing
+        ws.cell(row=wb_row, column=qty_col_idx).value = new_qty
+        if history_col_idx is not None:
+            ws.cell(row=wb_row, column=history_col_idx).value = new_hist
+
+    wb.save(inventory_path)
+
     return (success_count, failed_list)
 
 
