@@ -380,6 +380,12 @@ def merge_order_and_prices(order_path: str, prices_path_or_df) -> pd.DataFrame:
     col_item = find_column(df_order, ["име на артикул", "артикул", "продукт", "Item Number"])
     col_qty = find_column(df_order, ["заявени бройки", "бройки", "количество", "Quantity Ordered"])
     col_date = find_column(df_order, ["дата на доставка", "доставка", "delivery", "Due Date"])
+    
+    # Try to find Purchase Order Line column for sorting
+    try:
+        col_order_line = find_column(df_order, ["Purchase Order Line", "ред на поръчка", "order line"])
+    except Exception:
+        col_order_line = None
 
     # Find prices columns
     p_item = find_column(df_prices, ["код АЛ филтър", "артикул", "item"])
@@ -474,6 +480,13 @@ def merge_order_and_prices(order_path: str, prices_path_or_df) -> pd.DataFrame:
         item = r.get(col_item)
         qty = r.get(col_qty)
         ddate = r.get(col_date)
+        
+        # Get the actual order line number if available
+        order_line = None
+        if col_order_line is not None:
+            order_line = r.get(col_order_line)
+            if pd.notna(order_line):
+                order_line = int(order_line)
 
         if pd.isna(order_no) or pd.isna(item):
             continue
@@ -488,7 +501,9 @@ def merge_order_and_prices(order_path: str, prices_path_or_df) -> pd.DataFrame:
             continue
 
         line_no += 1
-        order_ref = f"{order_no}-{line_no}"
+        # Use actual order line number if available, otherwise use counter
+        actual_line = order_line if order_line is not None else line_no
+        order_ref = f"{order_no}-{actual_line}"
 
         # find price row - STRICT matching by canonical code only
         # (артикулният номер от поръчката трябва да съвпада точно с "код АЛ филтър")
@@ -567,7 +582,24 @@ def merge_order_and_prices(order_path: str, prices_path_or_df) -> pd.DataFrame:
             "Материал": mat,
         })
 
-    return pd.DataFrame(out_rows)
+    result_df = pd.DataFrame(out_rows)
+    
+    # Sort by order line number (extracted from "Номер на поръчка и ред")
+    if not result_df.empty and "Номер на поръчка и ред" in result_df.columns:
+        def extract_line_number(ref):
+            """Extract the line number from 'B26801-5' format."""
+            try:
+                parts = str(ref).split("-")
+                if len(parts) >= 2:
+                    return int(parts[-1])
+            except:
+                pass
+            return 0
+        
+        result_df["_sort_key"] = result_df["Номер на поръчка и ред"].apply(extract_line_number)
+        result_df = result_df.sort_values("_sort_key").drop(columns=["_sort_key"]).reset_index(drop=True)
+    
+    return result_df
 
 
 def _apply_date_format_xlsx(path: Path, header_name: str = "Дата на доставка"):
@@ -735,17 +767,185 @@ def append_to_protocol(protocol_key: str, df_rows: pd.DataFrame, source_filename
 
 
 # -------------------------
+# Inventory (Наличности) Functions
+# -------------------------
+
+def load_inventory(inventory_path: str) -> pd.DataFrame:
+    """Load inventory file with available labels."""
+    df = read_excel_any(inventory_path)
+    return df
+
+
+def check_inventory(df_order: pd.DataFrame, df_inventory: pd.DataFrame) -> pd.DataFrame:
+    """
+    Check order against inventory and add columns:
+    - 'Налични' - how many are available in inventory
+    - 'Статус наличност' - status (Достатъчно / Недостатъчно / Няма)
+    
+    Matching is done by 'Технологичен лист' (тех.лист) column.
+    """
+    # Build inventory lookup by tech list
+    inv_lookup = {}
+    
+    # Find columns in inventory
+    tl_col = None
+    qty_col = None
+    name_col = None
+    
+    for col in df_inventory.columns:
+        col_lower = str(col).strip().lower()
+        if col_lower in ['тех.лист', 'технологичен лист', 'тл']:
+            tl_col = col
+        elif col_lower in ['налични бройки', 'налични', 'количество', 'qty']:
+            qty_col = col
+        elif col_lower in ['име', 'артикул', 'name']:
+            name_col = col
+    
+    if tl_col is None or qty_col is None:
+        # Can't process without these columns
+        df_order['Налични'] = ''
+        df_order['Статус наличност'] = 'Няма данни'
+        return df_order
+    
+    # Build lookup
+    for _, row in df_inventory.iterrows():
+        tl = row.get(tl_col)
+        if pd.isna(tl):
+            continue
+        tl_str = str(tl).strip()
+        qty = row.get(qty_col)
+        if pd.isna(qty):
+            qty = 0
+        else:
+            qty = int(qty)
+        inv_lookup[tl_str] = qty
+    
+    # Add columns to order
+    available_list = []
+    status_list = []
+    
+    for _, row in df_order.iterrows():
+        tl = row.get('Технологичен лист', '')
+        ordered_qty = row.get('Бройки', 0)
+        
+        if pd.isna(tl) or str(tl).strip() == '':
+            available_list.append('')
+            status_list.append('')
+            continue
+        
+        tl_str = str(tl).strip()
+        available = inv_lookup.get(tl_str, 0)
+        available_list.append(available)
+        
+        if available == 0:
+            status_list.append('Няма')
+        elif available >= ordered_qty:
+            status_list.append('Достатъчно')
+        else:
+            status_list.append(f'Недостатъчно ({available})')
+    
+    df_order['Налични'] = available_list
+    df_order['Статус наличност'] = status_list
+    
+    return df_order
+
+
+def reserve_inventory(df_order: pd.DataFrame, inventory_path: str, order_ref: str = None) -> tuple:
+    """
+    Reserve items from inventory based on order.
+    Updates the inventory file by:
+    - Subtracting ordered quantities from available
+    - Adding reservation note to history column
+    
+    Returns: (success_count, failed_list)
+    """
+    from datetime import datetime
+    
+    df_inventory = read_excel_any(inventory_path)
+    
+    # Find columns
+    tl_col = None
+    qty_col = None
+    history_col = None
+    
+    for col in df_inventory.columns:
+        col_lower = str(col).strip().lower()
+        if col_lower in ['тех.лист', 'технологичен лист', 'тл']:
+            tl_col = col
+        elif col_lower in ['налични бройки', 'налични', 'количество']:
+            qty_col = col
+        elif 'поръчка' in col_lower or 'history' in col_lower:
+            history_col = col
+    
+    if tl_col is None or qty_col is None:
+        return (0, ['Липсват необходими колони в файла с наличности'])
+    
+    success_count = 0
+    failed_list = []
+    today = datetime.now().strftime('%d.%m')
+    
+    for _, order_row in df_order.iterrows():
+        tl = order_row.get('Технологичен лист', '')
+        ordered_qty = order_row.get('Бройки', 0)
+        order_no = order_row.get('Номер на поръчка и ред', order_ref or '')
+        
+        if pd.isna(tl) or str(tl).strip() == '' or ordered_qty == 0:
+            continue
+        
+        tl_str = str(tl).strip()
+        
+        # Find matching row in inventory
+        mask = df_inventory[tl_col].astype(str).str.strip() == tl_str
+        if not mask.any():
+            failed_list.append(f'{tl_str}: Не е намерен в наличности')
+            continue
+        
+        idx = df_inventory[mask].index[0]
+        current_qty = df_inventory.loc[idx, qty_col]
+        if pd.isna(current_qty):
+            current_qty = 0
+        else:
+            current_qty = int(current_qty)
+        
+        if current_qty < ordered_qty:
+            failed_list.append(f'{tl_str}: Недостатъчно ({current_qty} < {ordered_qty})')
+            # Still reserve what's available
+            reserved = current_qty
+            df_inventory.loc[idx, qty_col] = 0
+        else:
+            reserved = ordered_qty
+            df_inventory.loc[idx, qty_col] = current_qty - ordered_qty
+        
+        # Update history
+        if history_col is not None:
+            current_history = df_inventory.loc[idx, history_col]
+            new_entry = f'{order_no} {reserved} {today}'
+            if pd.isna(current_history) or str(current_history).strip() == '':
+                df_inventory.loc[idx, history_col] = new_entry
+            else:
+                df_inventory.loc[idx, history_col] = f'{current_history}; {new_entry}'
+        
+        success_count += 1
+    
+    # Save updated inventory
+    df_inventory.to_excel(inventory_path, index=False)
+    
+    return (success_count, failed_list)
+
+
+# -------------------------
 # Tkinter UI
 # -------------------------
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Сливане на поръчка + цени (Excel)")
-        self.geometry("1200x650")
+        self.geometry("1200x700")
 
         self.order_path = tk.StringVar(value="")
         self.prices_path = tk.StringVar(value="")
         self.protocols_dir_var = tk.StringVar(value="(не е избрана)")
+        self.inventory_path = tk.StringVar(value="(не е избран)")
 
         self.df_merged = None
         self._rendered_index_map = []
@@ -788,14 +988,26 @@ class App(tk.Tk):
         btn_close_protocol.grid(row=1, column=3, padx=5, pady=2, sticky="w")
         btn_reopen_protocol.grid(row=1, column=4, padx=5, pady=2, sticky="w")
 
-        ttk.Label(top, text="Поръчка:").grid(row=2, column=0, sticky="w")
-        ttk.Label(top, textvariable=self.order_path).grid(row=2, column=1, columnspan=6, sticky="w")
+        # Row 3 - inventory buttons
+        btn_load_inventory = ttk.Button(top, text="Качи наличности", command=self.pick_inventory)
+        btn_check_inventory = ttk.Button(top, text="Провери наличности", command=self.check_inventory_ui)
+        btn_reserve_inventory = ttk.Button(top, text="Резервирай от склад", command=self.reserve_inventory_ui)
+        
+        btn_load_inventory.grid(row=2, column=0, padx=5, pady=2, sticky="w")
+        btn_check_inventory.grid(row=2, column=1, padx=5, pady=2, sticky="w")
+        btn_reserve_inventory.grid(row=2, column=2, padx=5, pady=2, sticky="w")
 
-        ttk.Label(top, text="Цени:").grid(row=3, column=0, sticky="w")
-        ttk.Label(top, textvariable=self.prices_path).grid(row=3, column=1, columnspan=6, sticky="w")
+        ttk.Label(top, text="Поръчка:").grid(row=3, column=0, sticky="w")
+        ttk.Label(top, textvariable=self.order_path).grid(row=3, column=1, columnspan=6, sticky="w")
 
-        ttk.Label(top, text="Протоколи: ").grid(row=4, column=0, sticky="w")
-        ttk.Label(top, textvariable=self.protocols_dir_var).grid(row=4, column=1, columnspan=6, sticky="w")
+        ttk.Label(top, text="Цени:").grid(row=4, column=0, sticky="w")
+        ttk.Label(top, textvariable=self.prices_path).grid(row=4, column=1, columnspan=6, sticky="w")
+
+        ttk.Label(top, text="Протоколи:").grid(row=5, column=0, sticky="w")
+        ttk.Label(top, textvariable=self.protocols_dir_var).grid(row=5, column=1, columnspan=6, sticky="w")
+
+        ttk.Label(top, text="Наличности:").grid(row=6, column=0, sticky="w")
+        ttk.Label(top, textvariable=self.inventory_path).grid(row=6, column=1, columnspan=6, sticky="w")
 
         mid = ttk.Frame(self, padding=(10, 0, 10, 10))
         mid.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
@@ -822,6 +1034,192 @@ class App(tk.Tk):
         )
         if path:
             self.order_path.set(path)
+
+    def pick_inventory(self):
+        """Select inventory file with available labels."""
+        path = filedialog.askopenfilename(
+            title="Избери файл с наличности",
+            filetypes=[("Excel", "*.xlsx"), ("Excel 97-2003", "*.xls"), ("All files", "*.*")]
+        )
+        if path:
+            self.inventory_path.set(path)
+            self.status.set(f"Зареден файл с наличности: {Path(path).name}")
+
+    def check_inventory_ui(self):
+        """Check current order against inventory - show rich popup with colored table."""
+        if self.df_merged is None or self.df_merged.empty:
+            messagebox.showwarning("Няма данни", "Първо зареди и слей поръчка.")
+            return
+
+        inv_path = self.inventory_path.get()
+        if inv_path == "(не е избран)" or not Path(inv_path).exists():
+            messagebox.showwarning("Наличности", "Първо качи файл с наличности.")
+            return
+
+        try:
+            df_inventory = load_inventory(inv_path)
+            self.df_merged = check_inventory(self.df_merged, df_inventory)
+            self._load_table(self.df_merged)
+        except Exception as e:
+            messagebox.showerror("Грешка", f"Грешка при проверка: {e}")
+            return
+
+        # --- Build popup ---
+        popup = tk.Toplevel(self)
+        popup.title("Проверка на наличности")
+        popup.geometry("900x600")
+        popup.minsize(700, 450)
+
+        # Header
+        hdr = ttk.Frame(popup, padding=(15, 12, 15, 6))
+        hdr.pack(fill=tk.X)
+        ttk.Label(hdr, text="📦  Проверка на наличности", font=("", 15, "bold")).pack(side=tk.LEFT)
+
+        # Summary badges
+        total = len(self.df_merged)
+        ok_rows   = self.df_merged[self.df_merged.get('Статус наличност', pd.Series(dtype=str)) == 'Достатъчно'] if 'Статус наличност' in self.df_merged.columns else pd.DataFrame()
+        low_rows  = self.df_merged[self.df_merged.get('Статус наличност', pd.Series(dtype=str)).str.startswith('Недостатъчно', na=False)] if 'Статус наличност' in self.df_merged.columns else pd.DataFrame()
+        none_rows = self.df_merged[self.df_merged.get('Статус наличност', pd.Series(dtype=str)) == 'Няма'] if 'Статус наличност' in self.df_merged.columns else pd.DataFrame()
+        no_tl     = self.df_merged[self.df_merged.get('Статус наличност', pd.Series(dtype=str)) == ''] if 'Статус наличност' in self.df_merged.columns else pd.DataFrame()
+
+        badge_frame = ttk.Frame(hdr)
+        badge_frame.pack(side=tk.RIGHT)
+        tk.Label(badge_frame, text=f"✅ Достатъчно: {len(ok_rows)}", bg="#d4edda", fg="#155724", padx=8, pady=3, font=("", 10, "bold")).pack(side=tk.LEFT, padx=3)
+        tk.Label(badge_frame, text=f"⚠️  Недостатъчно: {len(low_rows)}", bg="#fff3cd", fg="#856404", padx=8, pady=3, font=("", 10, "bold")).pack(side=tk.LEFT, padx=3)
+        tk.Label(badge_frame, text=f"🔴 Няма: {len(none_rows)}", bg="#f8d7da", fg="#721c24", padx=8, pady=3, font=("", 10, "bold")).pack(side=tk.LEFT, padx=3)
+        tk.Label(badge_frame, text=f"⬜ Без ТЛ: {len(no_tl)}", bg="#e2e3e5", fg="#383d41", padx=8, pady=3, font=("", 10, "bold")).pack(side=tk.LEFT, padx=3)
+
+        ttk.Separator(popup, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=10)
+
+        # Filter buttons
+        filter_frame = ttk.Frame(popup, padding=(10, 6))
+        filter_frame.pack(fill=tk.X)
+        ttk.Label(filter_frame, text="Покажи:").pack(side=tk.LEFT, padx=(0, 6))
+        filter_var = tk.StringVar(value="Всички")
+
+        def apply_filter(val):
+            filter_var.set(val)
+            refresh_table()
+
+        for label in ["Всички", "Достатъчно", "Недостатъчно", "Няма"]:
+            ttk.Button(filter_frame, text=label, width=14,
+                       command=lambda l=label: apply_filter(l)).pack(side=tk.LEFT, padx=2)
+
+        # Table
+        cols = ("Артикул", "ТЛ", "Поръчани", "Налични", "Остатък", "Статус")
+        table_frame = ttk.Frame(popup)
+        table_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(4, 0))
+
+        tree = ttk.Treeview(table_frame, columns=cols, show="headings", height=20)
+        vsb = ttk.Scrollbar(table_frame, orient="vertical", command=tree.yview)
+        hsb = ttk.Scrollbar(table_frame, orient="horizontal", command=tree.xview)
+        tree.configure(yscroll=vsb.set, xscroll=hsb.set)
+
+        col_widths = {"Артикул": 220, "ТЛ": 70, "Поръчани": 90, "Налични": 90, "Остатък": 90, "Статус": 160}
+        for c in cols:
+            tree.heading(c, text=c)
+            tree.column(c, width=col_widths.get(c, 100), anchor="center" if c != "Артикул" else "w")
+
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        hsb.pack(side=tk.BOTTOM, fill=tk.X)
+
+        # Row colors
+        tree.tag_configure("ok",    background="#d4edda", foreground="#155724")
+        tree.tag_configure("low",   background="#fff3cd", foreground="#856404")
+        tree.tag_configure("none",  background="#f8d7da", foreground="#721c24")
+        tree.tag_configure("notl",  background="#f8f9fa", foreground="#6c757d")
+
+        def refresh_table():
+            tree.delete(*tree.get_children())
+            flt = filter_var.get()
+            for _, row in self.df_merged.iterrows():
+                art     = str(row.get("Артикул", ""))
+                tl      = str(row.get("Технологичен лист", "")).strip()
+                ordered = row.get("Бройки", 0)
+                avail   = row.get("Налични", "")
+                status  = str(row.get("Статус наличност", "")).strip()
+
+                # Остатък
+                try:
+                    remainder = int(avail) - int(ordered)
+                    remainder_str = str(remainder)
+                except Exception:
+                    remainder_str = ""
+
+                # Tag
+                if status == "Достатъчно":
+                    tag = "ok"
+                elif status.startswith("Недостатъчно"):
+                    tag = "low"
+                elif status == "Няма":
+                    tag = "none"
+                else:
+                    tag = "notl"
+
+                # Filter
+                if flt == "Достатъчно"   and tag != "ok":   continue
+                if flt == "Недостатъчно" and tag != "low":  continue
+                if flt == "Няма"         and tag != "none": continue
+
+                avail_str = str(int(avail)) if avail != "" and avail == avail else "-"
+
+                tree.insert("", "end",
+                    values=(art, tl if tl else "-", ordered, avail_str, remainder_str, status if status else "Без ТЛ"),
+                    tags=(tag,))
+
+        refresh_table()
+
+        # Bottom bar
+        ttk.Separator(popup, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=10, pady=(6, 0))
+        bottom = ttk.Frame(popup, padding=(10, 8))
+        bottom.pack(fill=tk.X)
+
+        def do_reserve():
+            popup.destroy()
+            self.reserve_inventory_ui()
+
+        ttk.Button(bottom, text="Затвори", command=popup.destroy).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(bottom, text="✂️  Извади от склада", command=do_reserve).pack(side=tk.RIGHT, padx=5)
+
+        self.status.set("Наличностите са проверени")
+
+    def reserve_inventory_ui(self):
+        """Reserve items from inventory based on current order."""
+        if self.df_merged is None or self.df_merged.empty:
+            messagebox.showwarning("Няма данни", "Първо зареди и слей поръчка.")
+            return
+
+        inv_path = self.inventory_path.get()
+        if inv_path == "(не е избран)" or not Path(inv_path).exists():
+            messagebox.showwarning("Наличности", "Първо качи файл с наличности.")
+            return
+
+        # Confirm action
+        if not messagebox.askyesno("Потвърждение",
+            "Това ще намали наличностите в склада.\n\n"
+            "Сигурен ли си, че искаш да извадиш?"):
+            return
+
+        try:
+            success, failed = reserve_inventory(self.df_merged, inv_path)
+
+            msg = f"Извадени: {success} артикула\n"
+            if failed:
+                msg += f"\nПроблеми ({len(failed)}):\n"
+                for f in failed[:10]:
+                    msg += f"  • {f}\n"
+                if len(failed) > 10:
+                    msg += f"  ... и още {len(failed) - 10}"
+
+            messagebox.showinfo("Извадено от склад", msg)
+
+            # Refresh inventory check
+            self.check_inventory_ui()
+
+            self.status.set(f"Извадени {success} артикула от склада")
+        except Exception as e:
+            messagebox.showerror("Грешка", f"Грешка при резервиране: {e}")
 
     def pick_multiple_prices(self):
         """Open dialog to select multiple price files."""
