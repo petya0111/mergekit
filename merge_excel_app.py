@@ -776,6 +776,21 @@ def load_inventory(inventory_path: str) -> pd.DataFrame:
     return df
 
 
+def _norm_tl(val) -> str:
+    """
+    Normalise a tech-list value to a clean string for matching.
+    Handles float/int (22872.0 → "22872"), BOM, whitespace.
+    Returns "" for NaN/None/empty.
+    """
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return ""
+    s = str(val).lstrip('\ufeff').strip()
+    # "22872.0" → "22872"
+    if s.endswith('.0') and s[:-2].lstrip('-').isdigit():
+        s = s[:-2]
+    return s
+
+
 def _find_inv_col(columns, candidates: list) -> str:
     """
     Robustly find a column name from a list of candidates.
@@ -807,65 +822,62 @@ def check_inventory(df_order: pd.DataFrame, df_inventory: pd.DataFrame) -> pd.Da
     """
     Check order against inventory and add columns:
     - 'Налични' - how many are available in inventory
-    - 'Статус наличност' - status (Достатъчно / Недостатъчно / Няма)
+    - 'Статус наличност':
+        'Достатъчно'        - налични >= поръчани
+        'Недостатъчно (N)'  - 0 < налични < поръчани
+        'Няма'              - налични == 0 (но е в inventory)
+        'Не в склада'       - артикулът не фигурира в inventory
+        ''                  - артикулът няма стойност въобще
 
-    Matching is done by 'Технологичен лист' (тех.лист) column.
+    Matching by article number (колона 'ime'/'артикул'/'name' в inventory).
     """
-    import logging
-
-    logging.debug("check_inventory: inventory columns = %s", list(df_inventory.columns))
-
-    # Find columns in inventory (robust, Windows-safe)
-    tl_col  = _find_inv_col(df_inventory.columns,
-                            ['тех.лист', 'технологичен лист', 'тл', 'tech list', 'tl'])
+    # Find article name column in inventory
+    art_col = _find_inv_col(df_inventory.columns,
+                            ['име', 'артикул', 'name', 'item', 'item number', 'код'])
     qty_col = _find_inv_col(df_inventory.columns,
                             ['налични бройки', 'налични', 'количество', 'qty', 'quantity', 'бройки'])
 
-    logging.debug("check_inventory: tl_col=%s  qty_col=%s", tl_col, qty_col)
-
-    if tl_col is None or qty_col is None:
+    if art_col is None or qty_col is None:
         df_order['Налични'] = ''
         df_order['Статус наличност'] = 'Няма данни'
         return df_order
 
-    # Build lookup  { tl_str -> qty }
+    # Build lookup  { normalised_article -> qty }
     inv_lookup: dict = {}
     for _, row in df_inventory.iterrows():
-        tl = row.get(tl_col)
-        if pd.isna(tl):
+        art_str = _norm_tl(row.get(art_col))   # _norm_tl works for any string
+        if not art_str:
             continue
-        tl_str = str(tl).lstrip('\ufeff').strip()
         qty = row.get(qty_col)
         try:
             qty = int(float(qty)) if not pd.isna(qty) else 0
         except Exception:
             qty = 0
-        inv_lookup[tl_str] = qty
+        inv_lookup[art_str.upper()] = qty
 
-    logging.debug("check_inventory: built lookup with %d entries", len(inv_lookup))
-
-    # Find 'Технологичен лист' column in the order df (also robust)
-    order_tl_col = _find_inv_col(df_order.columns,
-                                 ['технологичен лист', 'тл', 'тех лист', 'tech list', 'tl'])
+    # Find article column in order df
+    order_art_col = _find_inv_col(df_order.columns,
+                                  ['артикул', 'item number', 'item', 'код', 'product'])
 
     available_list = []
     status_list = []
 
     for _, row in df_order.iterrows():
-        tl_raw = row.get(order_tl_col, '') if order_tl_col else ''
+        art_raw = row.get(order_art_col, '') if order_art_col else ''
         ordered_qty = row.get('Бройки', 0)
 
-        if pd.isna(tl_raw) or str(tl_raw).strip() == '':
+        art_str = _norm_tl(art_raw)
+
+        if not art_str:
             available_list.append('')
             status_list.append('')
             continue
 
-        tl_str = str(tl_raw).lstrip('\ufeff').strip()
-        available = inv_lookup.get(tl_str)   # None = not found at all
+        available = inv_lookup.get(art_str.upper())  # None = not in inventory
 
         if available is None:
             available_list.append('')
-            status_list.append('')
+            status_list.append('Не в склада')
         elif available == 0:
             available_list.append(0)
             status_list.append('Няма')
@@ -898,79 +910,77 @@ def reserve_inventory(df_order: pd.DataFrame, inventory_path: str, order_ref: st
     df_inventory = read_excel_any(inventory_path)
 
     # Robust column finding (handles BOM / Windows extra spaces)
-    tl_col      = _find_inv_col(df_inventory.columns,
-                                ['тех.лист', 'технологичен лист', 'тл', 'tech list', 'tl'])
+    art_col     = _find_inv_col(df_inventory.columns,
+                                ['име', 'артикул', 'name', 'item', 'item number', 'код'])
     qty_col     = _find_inv_col(df_inventory.columns,
                                 ['налични бройки', 'налични', 'количество', 'qty', 'quantity', 'бройки'])
     history_col = _find_inv_col(df_inventory.columns,
                                 ['поръчка, бройка, дата', 'поръчка', 'история', 'history'])
 
-    if tl_col is None or qty_col is None:
+    if art_col is None or qty_col is None:
         return (0, ['Липсват необходими колони в файла с наличности'])
 
     # Map column name → 1-based Excel column index
     col_list = list(df_inventory.columns)
-    tl_col_idx      = col_list.index(tl_col) + 1
+    art_col_idx     = col_list.index(art_col) + 1
     qty_col_idx     = col_list.index(qty_col) + 1
     history_col_idx = col_list.index(history_col) + 1 if history_col else None
 
-    # Also find 'Технологичен лист' in the order df
-    order_tl_col = _find_inv_col(df_order.columns,
-                                 ['технологичен лист', 'тл', 'тех лист', 'tech list', 'tl'])
+    # Find article column in the order df
+    order_art_col = _find_inv_col(df_order.columns,
+                                  ['артикул', 'item number', 'item', 'код', 'product'])
 
     success_count = 0
     failed_list   = []
     today         = datetime.now().strftime('%d.%m')
 
-    # Build TL → (df row index, current qty, history value) map from df_inventory
+    # Build ARTICLE → { df_idx, qty } map from df_inventory
     inv_map: dict = {}
     for i, row in df_inventory.iterrows():
-        tl = row.get(tl_col)
-        if pd.isna(tl):
+        art_str = _norm_tl(row.get(art_col))
+        if not art_str:
             continue
-        tl_str = str(tl).lstrip('\ufeff').strip()
         qty = row.get(qty_col)
         try:
             qty = int(float(qty)) if not pd.isna(qty) else 0
         except Exception:
             qty = 0
-        inv_map[tl_str] = {'df_idx': i, 'qty': qty}
+        inv_map[art_str.upper()] = {'df_idx': i, 'qty': qty}
 
     # Collect updates: { df_idx: (new_qty, new_history) }
     updates: dict = {}
 
     for _, order_row in df_order.iterrows():
-        tl_raw     = order_row.get(order_tl_col, '') if order_tl_col else ''
+        art_raw     = order_row.get(order_art_col, '') if order_art_col else ''
         ordered_qty = order_row.get('Бройки', 0)
-        order_no   = order_row.get('Номер на поръчка и ред', order_ref or '')
+        order_no    = order_row.get('Номер на поръчка и ред', order_ref or '')
 
-        if pd.isna(tl_raw) or str(tl_raw).strip() == '' or ordered_qty == 0:
+        art_str = _norm_tl(art_raw)
+        if not art_str or ordered_qty == 0:
             continue
 
-        tl_str = str(tl_raw).lstrip('\ufeff').strip()
-        entry  = inv_map.get(tl_str)
+        entry = inv_map.get(art_str.upper())
 
         if entry is None:
-            failed_list.append(f'{tl_str}: Не е намерен в наличности')
+            failed_list.append(f'{art_str}: Не е намерен в наличности')
             continue
 
         df_idx      = entry['df_idx']
         current_qty = entry['qty']
 
         if current_qty < ordered_qty:
-            failed_list.append(f'{tl_str}: Недостатъчно ({current_qty} < {ordered_qty})')
-            reserved    = current_qty
-            new_qty     = 0
+            failed_list.append(f'{art_str}: Недостатъчно ({current_qty} < {ordered_qty})')
+            reserved = current_qty
+            new_qty  = 0
         else:
             reserved = ordered_qty
             new_qty  = current_qty - ordered_qty
 
-        # Update the in-memory map so repeated articles accumulate
-        inv_map[tl_str]['qty'] = new_qty
+        # Update in-memory map so repeated articles accumulate correctly
+        inv_map[art_str.upper()]['qty'] = new_qty
 
         new_entry = f'{order_no} {reserved} {today}'
         if df_idx in updates:
-            # Multiple order rows for same TL
             prev_qty, prev_hist = updates[df_idx]
             updates[df_idx] = (new_qty, f'{prev_hist}; {new_entry}')
         else:
@@ -989,8 +999,6 @@ def reserve_inventory(df_order: pd.DataFrame, inventory_path: str, order_ref: st
     wb = load_workbook(inventory_path)
     ws = wb.active
 
-    # Find header row (row 1) column positions in the actual workbook
-    # (openpyxl rows are 1-indexed; df row 0 = wb row 2 because row 1 is header)
     for df_idx, (new_qty, new_hist) in updates.items():
         wb_row = df_idx + 2  # +1 for header, +1 for 1-based indexing
         ws.cell(row=wb_row, column=qty_col_idx).value = new_qty
@@ -1146,17 +1154,27 @@ class App(tk.Tk):
 
         # Summary badges
         total = len(self.df_merged)
-        ok_rows   = self.df_merged[self.df_merged.get('Статус наличност', pd.Series(dtype=str)) == 'Достатъчно'] if 'Статус наличност' in self.df_merged.columns else pd.DataFrame()
-        low_rows  = self.df_merged[self.df_merged.get('Статус наличност', pd.Series(dtype=str)).str.startswith('Недостатъчно', na=False)] if 'Статус наличност' in self.df_merged.columns else pd.DataFrame()
-        none_rows = self.df_merged[self.df_merged.get('Статус наличност', pd.Series(dtype=str)) == 'Няма'] if 'Статус наличност' in self.df_merged.columns else pd.DataFrame()
-        no_tl     = self.df_merged[self.df_merged.get('Статус наличност', pd.Series(dtype=str)) == ''] if 'Статус наличност' in self.df_merged.columns else pd.DataFrame()
+        def _get_status_rows(val):
+            if 'Статус наличност' not in self.df_merged.columns:
+                return pd.DataFrame()
+            s = self.df_merged['Статус наличност'].fillna('').astype(str)
+            if val == 'low':
+                return self.df_merged[s.str.startswith('Недостатъчно')]
+            return self.df_merged[s == val]
+
+        ok_rows       = _get_status_rows('Достатъчно')
+        low_rows      = _get_status_rows('low')
+        none_rows     = _get_status_rows('Няма')
+        nostock_rows  = _get_status_rows('Не в склада')
+        no_tl_rows    = _get_status_rows('')
 
         badge_frame = ttk.Frame(hdr)
         badge_frame.pack(side=tk.RIGHT)
-        tk.Label(badge_frame, text=f"✅ Достатъчно: {len(ok_rows)}", bg="#d4edda", fg="#155724", padx=8, pady=3, font=("", 10, "bold")).pack(side=tk.LEFT, padx=3)
-        tk.Label(badge_frame, text=f"⚠️  Недостатъчно: {len(low_rows)}", bg="#fff3cd", fg="#856404", padx=8, pady=3, font=("", 10, "bold")).pack(side=tk.LEFT, padx=3)
-        tk.Label(badge_frame, text=f"🔴 Няма: {len(none_rows)}", bg="#f8d7da", fg="#721c24", padx=8, pady=3, font=("", 10, "bold")).pack(side=tk.LEFT, padx=3)
-        tk.Label(badge_frame, text=f"⬜ Без ТЛ: {len(no_tl)}", bg="#e2e3e5", fg="#383d41", padx=8, pady=3, font=("", 10, "bold")).pack(side=tk.LEFT, padx=3)
+        tk.Label(badge_frame, text=f"✅ Достатъчно: {len(ok_rows)}",      bg="#d4edda", fg="#155724", padx=8, pady=3, font=("", 10, "bold")).pack(side=tk.LEFT, padx=2)
+        tk.Label(badge_frame, text=f"⚠️  Недостатъчно: {len(low_rows)}",  bg="#fff3cd", fg="#856404", padx=8, pady=3, font=("", 10, "bold")).pack(side=tk.LEFT, padx=2)
+        tk.Label(badge_frame, text=f"🔴 Няма: {len(none_rows)}",          bg="#f8d7da", fg="#721c24", padx=8, pady=3, font=("", 10, "bold")).pack(side=tk.LEFT, padx=2)
+        tk.Label(badge_frame, text=f"🔵 Не в склада: {len(nostock_rows)}", bg="#cce5ff", fg="#004085", padx=8, pady=3, font=("", 10, "bold")).pack(side=tk.LEFT, padx=2)
+        tk.Label(badge_frame, text=f"⬜ Без ТЛ: {len(no_tl_rows)}",       bg="#e2e3e5", fg="#383d41", padx=8, pady=3, font=("", 10, "bold")).pack(side=tk.LEFT, padx=2)
 
         ttk.Separator(popup, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=10)
 
@@ -1170,7 +1188,7 @@ class App(tk.Tk):
             filter_var.set(val)
             refresh_table()
 
-        for label in ["Всички", "Достатъчно", "Недостатъчно", "Няма"]:
+        for label in ["Всички", "Достатъчно", "Недостатъчно", "Няма", "Не в склада"]:
             ttk.Button(filter_frame, text=label, width=14,
                        command=lambda l=label: apply_filter(l)).pack(side=tk.LEFT, padx=2)
 
@@ -1194,10 +1212,11 @@ class App(tk.Tk):
         hsb.pack(side=tk.BOTTOM, fill=tk.X)
 
         # Row colors
-        tree.tag_configure("ok",    background="#d4edda", foreground="#155724")
-        tree.tag_configure("low",   background="#fff3cd", foreground="#856404")
-        tree.tag_configure("none",  background="#f8d7da", foreground="#721c24")
-        tree.tag_configure("notl",  background="#f8f9fa", foreground="#6c757d")
+        tree.tag_configure("ok",      background="#d4edda", foreground="#155724")
+        tree.tag_configure("low",     background="#fff3cd", foreground="#856404")
+        tree.tag_configure("none",    background="#f8d7da", foreground="#721c24")
+        tree.tag_configure("nostock", background="#cce5ff", foreground="#004085")
+        tree.tag_configure("notl",    background="#f8f9fa", foreground="#6c757d")
 
         def refresh_table():
             tree.delete(*tree.get_children())
@@ -1223,18 +1242,22 @@ class App(tk.Tk):
                     tag = "low"
                 elif status == "Няма":
                     tag = "none"
+                elif status == "Не в склада":
+                    tag = "nostock"
                 else:
                     tag = "notl"
 
                 # Filter
-                if flt == "Достатъчно"   and tag != "ok":   continue
-                if flt == "Недостатъчно" and tag != "low":  continue
-                if flt == "Няма"         and tag != "none": continue
+                if flt == "Достатъчно"   and tag != "ok":      continue
+                if flt == "Недостатъчно" and tag != "low":     continue
+                if flt == "Няма"         and tag != "none":    continue
+                if flt == "Не в склада"  and tag != "nostock": continue
 
                 avail_str = str(int(avail)) if avail != "" and avail == avail else "-"
+                display_status = status if status else "Без ТЛ"
 
                 tree.insert("", "end",
-                    values=(art, tl if tl else "-", ordered, avail_str, remainder_str, status if status else "Без ТЛ"),
+                    values=(art, tl if tl else "-", ordered, avail_str, remainder_str, display_status),
                     tags=(tag,))
 
         refresh_table()
