@@ -657,6 +657,68 @@ def _apply_date_format_xlsx(path: Path, header_name: str = "Дата на дос
             pass
 
 
+def _apply_inventory_colors_xlsx(path: Path):
+    """Оцветява редовете в записания Excel спрямо 'Статус наличност'."""
+    if load_workbook is None:
+        return
+    from openpyxl.styles import PatternFill
+
+    STATUS_FILLS = {
+        "Достатъчно":   PatternFill("solid", fgColor="D4EDDA"),
+        "Няма":         PatternFill("solid", fgColor="F8D7DA"),
+        "nostock":      PatternFill("solid", fgColor="CCE5FF"),   # Не в склада
+        "difftl":       PatternFill("solid", fgColor="E8D5F5"),   # Различен ТЛ
+        "low":          PatternFill("solid", fgColor="FFF3CD"),   # Недостатъчно
+    }
+
+    def _fill_for_status(s: str):
+        if not s:
+            return None
+        if s == "Достатъчно":
+            return STATUS_FILLS["Достатъчно"]
+        if s == "Няма":
+            return STATUS_FILLS["Няма"]
+        if s.startswith("Недостатъчно"):
+            return STATUS_FILLS["low"]
+        if s.startswith("Различен ТЛ"):
+            return STATUS_FILLS["difftl"]
+        if s == "Не в склада":
+            return STATUS_FILLS["nostock"]
+        return None
+
+    try:
+        wb = load_workbook(filename=str(path))
+        ws = wb.active
+        # Find header positions
+        status_col = None
+        max_col = ws.max_column
+        for cell in ws[1]:
+            try:
+                if str(cell.value).strip() == "Статус наличност":
+                    status_col = cell.column
+                    break
+            except Exception:
+                continue
+        if status_col is None:
+            wb.close()
+            return
+
+        for row in ws.iter_rows(min_row=2):
+            status_val = str(row[status_col - 1].value or "").strip()
+            fill = _fill_for_status(status_val)
+            if fill:
+                for cell in row:
+                    cell.fill = fill
+
+        wb.save(filename=str(path))
+        wb.close()
+    except Exception:
+        try:
+            wb.close()
+        except Exception:
+            pass
+
+
 def load_settings():
     try:
         if SETTINGS_FILE.exists():
@@ -1141,12 +1203,10 @@ class App(tk.Tk):
 
         # Row 3 - inventory buttons
         btn_load_inventory = ttk.Button(top, text="Качи наличности", command=self.pick_inventory)
-        btn_check_inventory = ttk.Button(top, text="Провери наличности", command=self.check_inventory_ui)
-        btn_reserve_inventory = ttk.Button(top, text="Резервирай от склад", command=self.reserve_inventory_ui)
+        btn_check_inventory = ttk.Button(top, text="📦 Провери и извади от склад", command=self.check_inventory_ui)
         
         btn_load_inventory.grid(row=2, column=0, padx=5, pady=2, sticky="w")
         btn_check_inventory.grid(row=2, column=1, padx=5, pady=2, sticky="w")
-        btn_reserve_inventory.grid(row=2, column=2, padx=5, pady=2, sticky="w")
 
         ttk.Label(top, text="Поръчка:").grid(row=3, column=0, sticky="w")
         ttk.Label(top, textvariable=self.order_path).grid(row=3, column=1, columnspan=6, sticky="w")
@@ -1218,8 +1278,8 @@ class App(tk.Tk):
         # --- Build popup ---
         popup = tk.Toplevel(self)
         popup.title("Проверка на наличности")
-        popup.geometry("900x600")
-        popup.minsize(700, 450)
+        popup.geometry("1000x640")
+        popup.minsize(750, 480)
 
         # Header
         hdr = ttk.Frame(popup, padding=(15, 12, 15, 6))
@@ -1227,7 +1287,6 @@ class App(tk.Tk):
         ttk.Label(hdr, text="📦  Проверка на наличности", font=("", 15, "bold")).pack(side=tk.LEFT)
 
         # Summary badges
-        total = len(self.df_merged)
         def _get_status_rows(val):
             if 'Статус наличност' not in self.df_merged.columns:
                 return pd.DataFrame()
@@ -1270,8 +1329,21 @@ class App(tk.Tk):
             ttk.Button(filter_frame, text=label, width=14,
                        command=lambda l=label: apply_filter(l)).pack(side=tk.LEFT, padx=2)
 
-        # Table
-        cols = ("Артикул", "ТЛ", "Поръчани", "Налични", "Остатък", "Статус")
+        # ── Select-all checkbox in header ─────────────────────────────────
+        select_all_var = tk.BooleanVar(value=False)
+
+        def _toggle_all():
+            state = select_all_var.get()
+            for iid in tree.get_children():
+                rd = row_data.get(iid)
+                if rd is None:
+                    continue
+                rd["checked"] = state
+                _update_check_cell(iid, state)
+            _update_deduct_btn()
+
+        # Table  ── columns: ☐ | Артикул | ТЛ | Поръчани | Налични | Остатък | Статус | Бр. за изв.
+        cols = ("☐", "Артикул", "ТЛ", "Поръчани", "Налични", "Остатък", "Статус", "Бр. за изв.")
         table_frame = ttk.Frame(popup)
         table_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(4, 0))
 
@@ -1280,41 +1352,80 @@ class App(tk.Tk):
         hsb = ttk.Scrollbar(table_frame, orient="horizontal", command=tree.xview)
         tree.configure(yscroll=vsb.set, xscroll=hsb.set)
 
-        col_widths = {"Артикул": 220, "ТЛ": 70, "Поръчани": 90, "Налични": 90, "Остатък": 90, "Статус": 180}
+        col_widths = {"☐": 36, "Артикул": 210, "ТЛ": 66, "Поръчани": 84,
+                      "Налични": 84, "Остатък": 84, "Статус": 170, "Бр. за изв.": 90}
         for c in cols:
-            tree.heading(c, text=c)
-            tree.column(c, width=col_widths.get(c, 100), anchor="center" if c != "Артикул" else "w")
+            tree.heading(c, text=c, anchor="center")
+            tree.column(c, width=col_widths.get(c, 100),
+                        anchor="w" if c == "Артикул" else "center",
+                        stretch=(c == "Артикул"))
+
+        # clicking the ☐ header = select/deselect all
+        tree.heading("☐", text="☐", command=_toggle_all)
 
         tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
         hsb.pack(side=tk.BOTTOM, fill=tk.X)
 
-        # Row colors
-        tree.tag_configure("ok",      background="#d4edda", foreground="#155724")
-        tree.tag_configure("low",     background="#fff3cd", foreground="#856404")
-        tree.tag_configure("none",    background="#f8d7da", foreground="#721c24")
-        tree.tag_configure("difftl",  background="#e8d5f5", foreground="#5a1e7a")
-        tree.tag_configure("nostock", background="#cce5ff", foreground="#004085")
-        tree.tag_configure("notl",    background="#f8f9fa", foreground="#6c757d")
+        # Row color tags  (two variants: normal + checked)
+        _TAG_COLORS = {
+            "ok":      ("#d4edda", "#155724"),
+            "low":     ("#fff3cd", "#856404"),
+            "none":    ("#f8d7da", "#721c24"),
+            "difftl":  ("#e8d5f5", "#5a1e7a"),
+            "nostock": ("#cce5ff", "#004085"),
+            "notl":    ("#f8f9fa", "#6c757d"),
+        }
+        _CHECKED_BG = "#b8daff"  # bright blue highlight when checked
+
+        for tag, (bg, fg) in _TAG_COLORS.items():
+            tree.tag_configure(tag,              background=bg, foreground=fg)
+            tree.tag_configure(tag + "_checked", background=_CHECKED_BG, foreground="#003070")
+
+        # row_data: iid → {df_idx, art, tl, ordered, avail, tag, checked, qty_var}
+        row_data: dict = {}
+
+        def _update_check_cell(iid, checked: bool):
+            """Update the ☐/☑ cell and row highlight for one iid."""
+            rd  = row_data.get(iid)
+            if rd is None:
+                return
+            tag = rd["tag"] + ("_checked" if checked else "")
+            vals = list(tree.item(iid, "values"))
+            vals[0] = "☑" if checked else "☐"
+            tree.item(iid, values=vals, tags=(tag,))
+
+        # Holder for btn_deduct (defined later, but referenced in _update_deduct_btn)
+        _widgets = {"btn_deduct": None}
+
+        def _update_deduct_btn():
+            """Enable/disable the deduct button based on selection."""
+            btn = _widgets.get("btn_deduct")
+            if btn is None:
+                return
+            n = sum(1 for rd in row_data.values() if rd["checked"])
+            if n:
+                btn.config(state="normal", text=f"✂️  Извади избраните ({n})")
+            else:
+                btn.config(state="disabled", text="✂️  Извади избраните")
 
         def refresh_table():
             tree.delete(*tree.get_children())
+            row_data.clear()
             flt = filter_var.get()
-            for _, row in self.df_merged.iterrows():
+            for idx, row in self.df_merged.iterrows():
                 art     = str(row.get("Артикул", ""))
                 tl      = str(row.get("Технологичен лист", "")).strip()
                 ordered = row.get("Бройки", 0)
                 avail   = row.get("Налични", "")
                 status  = str(row.get("Статус наличност", "")).strip()
 
-                # Остатък
                 try:
                     remainder = int(avail) - int(ordered)
                     remainder_str = str(remainder)
                 except Exception:
                     remainder_str = ""
 
-                # Tag
                 if status == "Достатъчно":
                     tag = "ok"
                 elif status.startswith("Недостатъчно"):
@@ -1328,7 +1439,6 @@ class App(tk.Tk):
                 else:
                     tag = "notl"
 
-                # Filter
                 if flt == "Достатъчно"   and tag != "ok":      continue
                 if flt == "Недостатъчно" and tag != "low":     continue
                 if flt == "Няма"         and tag != "none":    continue
@@ -1338,23 +1448,178 @@ class App(tk.Tk):
                 avail_str = str(int(avail)) if avail != "" and avail == avail else "-"
                 display_status = status if status else "Без ТЛ"
 
-                tree.insert("", "end",
-                    values=(art, tl if tl else "-", ordered, avail_str, remainder_str, display_status),
+                # default deduct qty = min(available, ordered)
+                try:
+                    default_qty = str(max(0, min(int(avail_str), int(ordered))))
+                except Exception:
+                    default_qty = str(ordered)
+
+                iid = tree.insert("", "end",
+                    values=("☐", art, tl if tl else "-", ordered,
+                            avail_str, remainder_str, display_status, default_qty),
                     tags=(tag,))
+                row_data[iid] = {
+                    "df_idx":  idx,
+                    "art":     art,
+                    "tl":      tl,
+                    "ordered": ordered,
+                    "avail":   avail_str,
+                    "tag":     tag,
+                    "checked": False,
+                    "qty":     default_qty,   # current value shown in col 8
+                }
+            _update_deduct_btn()
 
         refresh_table()
 
-        # Bottom bar
+        # ── Inline editing of "Бр. за изв." column ───────────────────────
+        _qty_entry_widget = [None]   # holds the active Entry widget
+
+        def _hide_qty_entry(save=True):
+            w = _qty_entry_widget[0]
+            if w is None:
+                return
+            iid, var = w._iid, w._var
+            if save:
+                val = var.get().strip()
+                rd  = row_data.get(iid)
+                if rd is not None:
+                    rd["qty"] = val
+                    vals = list(tree.item(iid, "values"))
+                    vals[7] = val
+                    tree.item(iid, values=vals)
+            w.destroy()
+            _qty_entry_widget[0] = None
+
+        def _show_qty_entry(iid):
+            _hide_qty_entry(save=True)
+            rd = row_data.get(iid)
+            if rd is None:
+                return
+            # Get bounding box of the "Бр. за изв." cell (column index 7, i.e. #8)
+            bbox = tree.bbox(iid, column="#8")
+            if not bbox:
+                return
+            x, y, w, h = bbox
+            var = tk.StringVar(value=rd["qty"])
+            entry = tk.Entry(tree, textvariable=var, justify="center",
+                             font=("", 10), relief="solid", bd=1)
+            entry._iid = iid
+            entry._var = var
+            entry.place(x=x, y=y, width=w, height=h)
+            entry.focus_set()
+            entry.select_range(0, tk.END)
+            entry.bind("<Return>",  lambda e: _hide_qty_entry(save=True))
+            entry.bind("<Tab>",     lambda e: _hide_qty_entry(save=True))
+            entry.bind("<Escape>",  lambda e: _hide_qty_entry(save=False))
+            entry.bind("<FocusOut>", lambda e: _hide_qty_entry(save=True))
+            _qty_entry_widget[0] = entry
+
+        # ── Click handler ─────────────────────────────────────────────────
+        def _on_click(event):
+            iid = tree.identify_row(event.y)
+            col = tree.identify_column(event.x)
+            if not iid:
+                _hide_qty_entry(save=True)
+                return
+
+            if col == "#1":               # ── checkbox column ──
+                _hide_qty_entry(save=True)
+                rd = row_data.get(iid)
+                if rd is None:
+                    return
+                rd["checked"] = not rd["checked"]
+                _update_check_cell(iid, rd["checked"])
+                _update_deduct_btn()
+                return
+
+            if col == "#8":               # ── Бр. за изв. column ──
+                _show_qty_entry(iid)
+                return
+
+            _hide_qty_entry(save=True)
+
+        tree.bind("<ButtonRelease-1>", _on_click)
+
+        # ── Bottom bar ────────────────────────────────────────────────────
         ttk.Separator(popup, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=10, pady=(6, 0))
         bottom = ttk.Frame(popup, padding=(10, 8))
         bottom.pack(fill=tk.X)
 
-        def do_reserve():
-            popup.destroy()
-            self.reserve_inventory_ui()
+        def _do_deduct_selected():
+            _hide_qty_entry(save=True)
+            inv_path_val = self.inventory_path.get()
+            if inv_path_val == "(не е избран)" or not Path(inv_path_val).exists():
+                messagebox.showwarning("Наличности", "Първо качи файл с наличности.", parent=popup)
+                return
 
+            selected = {iid: rd for iid, rd in row_data.items() if rd["checked"]}
+            if not selected:
+                return
+
+            # Validate quantities first
+            errors = []
+            for iid, rd in selected.items():
+                try:
+                    q = int(rd["qty"])
+                    if q <= 0:
+                        raise ValueError
+                except ValueError:
+                    errors.append(f"{rd['art']}: невалидно количество '{rd['qty']}'")
+            if errors:
+                messagebox.showerror("Грешка", "\n".join(errors), parent=popup)
+                return
+
+            # Confirm
+            lines = "\n".join(
+                f"  • {rd['art']}  →  {rd['qty']} бр."
+                for rd in selected.values()
+            )
+            if not messagebox.askyesno(
+                    "Потвърждение",
+                    f"Ще се приспаднат от склада:\n\n{lines}\n\nПродължаваш?",
+                    parent=popup):
+                return
+
+            # Build combined single-row-per-item DataFrame and call reserve_inventory
+            rows_to_reserve = []
+            for iid, rd in selected.items():
+                df_idx  = rd["df_idx"]
+                one_row = self.df_merged.loc[[df_idx]].copy()
+                one_row["Бројки"] = int(rd["qty"])   # override with chosen qty
+                one_row["Бройки"] = int(rd["qty"])
+                rows_to_reserve.append(one_row)
+
+            combined_df = pd.concat(rows_to_reserve, ignore_index=True)
+
+            try:
+                success, failed = reserve_inventory(combined_df, inv_path_val)
+            except Exception as ex:
+                messagebox.showerror("Грешка", str(ex), parent=popup)
+                return
+
+            # Refresh inventory data
+            try:
+                df_inv_fresh = load_inventory(inv_path_val)
+                self.df_merged = check_inventory(self.df_merged, df_inv_fresh)
+                self._load_table(self.df_merged)
+            except Exception:
+                pass
+            refresh_table()
+
+            msg = f"✅ Приспаднати {success} артикула от склада."
+            if failed:
+                msg += f"\n\nПроблеми:\n" + "\n".join(f"  • {f}" for f in failed[:10])
+            messagebox.showinfo("Извадено от склада", msg, parent=popup)
+
+        btn_deduct = ttk.Button(bottom, text="✂️  Извади избраните",
+                                state="disabled", command=_do_deduct_selected)
+        btn_deduct.pack(side=tk.LEFT, padx=(0, 10))
+        _widgets["btn_deduct"] = btn_deduct
+
+        ttk.Label(bottom, text="☐ = избери ред  |  кликни 'Бр. за изв.' за да промениш количеството",
+                  foreground="#555").pack(side=tk.LEFT, padx=4)
         ttk.Button(bottom, text="Затвори", command=popup.destroy).pack(side=tk.RIGHT, padx=5)
-        ttk.Button(bottom, text="✂️  Извади от склада", command=do_reserve).pack(side=tk.RIGHT, padx=5)
 
         self.status.set("Наличностите са проверени")
 
@@ -1917,6 +2182,13 @@ class App(tk.Tk):
             messagebox.showwarning("Липсват файлове", "Моля избери и двата файла (Поръчка и Цени).")
             return
 
+        # Изискване: първо трябва да са качени наличности
+        inv_path = self.inventory_path.get()
+        if inv_path == "(не е избран)" or not Path(inv_path).exists():
+            messagebox.showwarning("Наличности", 
+                "Първо качи файл с наличности,\nза да се покаже статусът на артикулите.")
+            return
+
         try:
             # Check if we have multiple price files
             if self._multiple_prices_paths:
@@ -1928,9 +2200,18 @@ class App(tk.Tk):
                 self.df_merged = merge_order_and_prices(op, combined_prices)
             else:
                 self.df_merged = merge_order_and_prices(op, pp)
+
+            # Автоматично добавяне на колони Налични / Статус наличност
+            try:
+                df_inventory = load_inventory(inv_path)
+                self.df_merged = check_inventory(self.df_merged, df_inventory)
+            except Exception as inv_err:
+                # Ако не успее, продължаваме без инвентарни колони
+                print(f"Предупреждение: {inv_err}")
+
             self._current_file_path = None  # New merge, no file yet
             self._load_table(self.df_merged)
-            self.status.set(f"Готово: {len(self.df_merged)} реда слети.")
+            self.status.set(f"Готово: {len(self.df_merged)} реда слети с наличности.")
         except Exception as e:
             messagebox.showerror("Грешка", str(e))
             self.status.set("Грешка при сливане.")
@@ -2012,8 +2293,21 @@ class App(tk.Tk):
                 except Exception:
                     pass  # If can't read existing, just overwrite
             
+            # Наредба на колоните: стандартните отпред, Налични/Статус накрая
+            standard_cols = [c for c in df_to_save.columns
+                             if c not in ("Налични", "Статус наличност")]
+            inv_cols = [c for c in ("Налични", "Статус наличност")
+                        if c in df_to_save.columns]
+            df_to_save = df_to_save[standard_cols + inv_cols]
+
             with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
                 df_to_save.to_excel(writer, index=False, sheet_name="Porachka")
+
+            # Оцветяване на статусните редове
+            try:
+                _apply_inventory_colors_xlsx(out_path)
+            except Exception:
+                pass
             
             # Прилагаме формат за дата
             try:
