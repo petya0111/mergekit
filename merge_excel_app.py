@@ -1047,7 +1047,6 @@ def reserve_inventory(df_order: pd.DataFrame, inventory_path: str, order_ref: st
 
     success_count = 0
     failed_list   = []
-    today         = datetime.now().strftime('%d.%m')
 
     # Build TWO maps: by article name and by tech list (shared entry objects)
     art_map: dict = {}   # { UPPER(article) -> entry }
@@ -1092,6 +1091,17 @@ def reserve_inventory(df_order: pd.DataFrame, inventory_path: str, order_ref: st
         ordered_qty = order_row.get('Бройки', 0)
         order_no    = order_row.get('Номер на поръчка и ред', order_ref or '')
 
+        # Дата на доставка от поръчката (вместо днешна дата)
+        delivery_date_raw = order_row.get('Дата на доставка', '')
+        try:
+            if delivery_date_raw and not pd.isna(delivery_date_raw):
+                dt = pd.to_datetime(delivery_date_raw, dayfirst=True, errors='coerce')
+                delivery_date = dt.strftime('%d.%m') if not pd.isna(dt) else ''
+            else:
+                delivery_date = ''
+        except Exception:
+            delivery_date = str(delivery_date_raw).strip()
+
         entry, label = _find_entry(order_row)
 
         if not label or ordered_qty == 0:
@@ -1115,7 +1125,7 @@ def reserve_inventory(df_order: pd.DataFrame, inventory_path: str, order_ref: st
         # Update in-memory qty so repeated rows accumulate correctly
         entry['qty'] = new_qty
 
-        new_entry = f'{order_no} {reserved} {today}'
+        new_entry = f'{order_no} {reserved} {delivery_date}'.strip()
         if df_idx in updates:
             prev_qty, prev_hist = updates[df_idx]
             updates[df_idx] = (new_qty, f'{prev_hist}; {new_entry}')
